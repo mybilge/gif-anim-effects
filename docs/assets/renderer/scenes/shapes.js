@@ -1,6 +1,6 @@
 import * as THREE from '../vendor/three-0.186.1/three.module.js';
 
-export function create(renderer, { scale, tilt }, loop, shape, seed) {
+export function create(renderer, params, loop, shape, seed) {
   const camera = new THREE.PerspectiveCamera(40, 1, 0.05, 20);
   camera.position.z = shape === 'inside-sphere' ? 0 : 3.2;
   const material = new THREE.MeshBasicMaterial({
@@ -11,6 +11,7 @@ export function create(renderer, { scale, tilt }, loop, shape, seed) {
   const group = new THREE.Group();
   const scene = new THREE.Scene().add(group);
   const geometries = [];
+  const inputMaterials = [];
   function mesh(geometry, x = 0, y = 0, z = 0) {
     const normal = geometry.getAttribute('normal');
     const colors = [];
@@ -36,7 +37,20 @@ export function create(renderer, { scale, tilt }, loop, shape, seed) {
     case 'expanding-balloon': mesh(new THREE.SphereGeometry(0.8, 48, 24)); break;
     case 'low-poly-sphere': mesh(new THREE.IcosahedronGeometry(0.85, 1)); break;
     case 'inside-sphere': mesh(new THREE.SphereGeometry(2, 48, 24)); break;
-    case 'pyramid': mesh(new THREE.ConeGeometry(0.85, 1.5, 4)); break;
+    case 'pyramid': {
+      const geometry = new THREE.ConeGeometry(0.85, 1.5, 4);
+      const index = geometry.index;
+      const positions = geometry.getAttribute('position');
+      geometry.clearGroups();
+      for (let i = 0; i < index.count; i += 3) {
+        const vertices = [index.getX(i), index.getX(i + 1), index.getX(i + 2)];
+        const x = vertices.reduce((sum, v) => sum + positions.getX(v), 0);
+        const z = vertices.reduce((sum, v) => sum + positions.getZ(v), 0);
+        const base = vertices.every((v) => positions.getY(v) < -0.74);
+        geometry.addGroup(i, 3, base ? 4 : Math.floor(((Math.atan2(z, x) + Math.PI * 2) % (Math.PI * 2)) / (Math.PI / 2)));
+      }
+      mesh(geometry); break;
+    }
     case 'rotating-donut': mesh(new THREE.TorusGeometry(0.57, 0.23, 24, 48)); break;
     case 'rotating-head': {
       const head = mesh(new THREE.SphereGeometry(0.58, 32, 24));
@@ -58,11 +72,18 @@ export function create(renderer, { scale, tilt }, loop, shape, seed) {
       break;
     default: throw new Error(`Unknown bundled shape: ${shape}`);
   }
-  group.scale.setScalar(scale);
   return {
     render(input, target, frame) {
+      const { scale, tilt } = params;
+      group.scale.setScalar(scale);
       if (!material.map) material.needsUpdate = true;
       material.map = input;
+      if (frame.inputs?.length > 1) {
+        const count = shape === 'sun-and-planet' ? 2 : shape === 'pyramid' ? 5 : 6;
+        if (!inputMaterials.length) for (let i = 0; i < count; i++) inputMaterials.push(material.clone());
+        inputMaterials.forEach((m, i) => { m.map = frame.inputs[i % frame.inputs.length]; });
+        group.children.forEach((object, i) => { object.material = shape === 'sun-and-planet' ? inputMaterials[i] : inputMaterials; });
+      } else group.children.forEach((object) => { object.material = material; });
       camera.aspect = frame.width / frame.height;
       camera.updateProjectionMatrix();
       const a = 2 * Math.PI * frame.progress(loop);
@@ -90,6 +111,6 @@ export function create(renderer, { scale, tilt }, loop, shape, seed) {
       renderer.setRenderTarget(target);
       renderer.render(scene, camera);
     },
-    dispose() { material.dispose(); geometries.forEach((g) => g.dispose()); },
+    dispose() { material.dispose(); inputMaterials.forEach((m) => m.dispose()); geometries.forEach((g) => g.dispose()); },
   };
 }

@@ -1,9 +1,9 @@
-export const ENGINE_VERSION = '0.4.0';
+export const ENGINE_VERSION = '0.6.0';
 export const SCENE_MODULES = { cube: './scenes/cube.js', ...Object.fromEntries([
   'random-rotations', 'figure-eight', 'wobbly-cube', 'diagonal-cube', 'photo-cube',
   'rotating-sphere', 'low-poly-sphere', 'inside-sphere', 'pyramid', 'rotating-donut', 'rotating-head', 'sun-and-planet', 'expanding-balloon',
 ].map((id) => [id, './scenes/shapes.js'])) };
-const ALGORITHMS = ['ghost-trail', 'motion-blur', 'trailing-left', 'trailing-top', 'content-aware'];
+const ALGORITHMS = ['ghost-trail', 'motion-blur', 'trailing-left', 'trailing-top', 'content-aware', 'random-per-frame'];
 export const CATEGORIES = ['spins', 'shapes', 'motion', 'distortion', 'glitch', 'grids', 'depth', 'filters'];
 const ID = /^[a-z][a-z0-9-]{0,63}$/;
 const PARAMETER = /^[a-z][a-zA-Z0-9_]{0,47}$/;
@@ -46,6 +46,13 @@ export function validateMetadata(m, { external = false } = {}) {
   requireValue(!external || m.engineType === 'glsl', 'external.engineType', m.engineType);
   requireValue(m.engineType === 'glsl' ? FILE.test(m.entry) && m.entry.endsWith('.frag') :
     (m.engineType === 'scene' && Object.hasOwn(SCENE_MODULES, m.entry)) || (m.engineType === 'algorithm' && ALGORITHMS.includes(m.entry)), 'entry', m.entry);
+  if (m.engineType === 'algorithm' && m.entry === 'random-per-frame') {
+    requireValue(m.pool && typeof m.pool === 'object' && !Array.isArray(m.pool) && Object.keys(m.pool).length >= 2, `${m.id}.pool`, m.pool);
+    for (const [id, version] of Object.entries(m.pool)) {
+      requireValue(ID.test(id) && id !== m.id, `${m.id}.pool.id`, id);
+      compareVersions(version, version);
+    }
+  }
   requireValue(['loop', 'once', 'static'].includes(m.durationBehavior), 'durationBehavior', m.durationBehavior);
   requireValue(['seamless', 'normal', 'none'].includes(m.loopBehavior), 'loopBehavior', m.loopBehavior);
   requireValue(['none', 'seeded', 'time-step'].includes(m.randomness), 'randomness', m.randomness);
@@ -60,10 +67,11 @@ export function validateMetadata(m, { external = false } = {}) {
     requireValue(typeof asset.source === 'string' && asset.source.length > 0 && typeof asset.license === 'string' && asset.license.length > 0, 'assets.license/source', asset);
   }
   requireValue(Array.isArray(m.parameters) && m.parameters.length <= 32, 'parameters', m.parameters);
+  requireValue(m.imageInputs === undefined || Number.isInteger(m.imageInputs) && m.imageInputs >= 2 && m.imageInputs <= 100, 'imageInputs', m.imageInputs);
   const ids = new Set();
   for (const p of m.parameters) {
     requireValue(typeof p.id === 'string' && PARAMETER.test(p.id) && !ids.has(p.id) &&
-      !['source', 'resolution', 'time', 'progress', 'seed', 'image', 'imageAspect', 'fit', 'background', 'flipY', 'checker'].includes(p.id), 'parameter.id', p.id);
+      !/^input\d+$/.test(p.id) && !['source', 'resolution', 'time', 'progress', 'seed', 'image', 'imageAspect', 'fit', 'background', 'flipY', 'checker'].includes(p.id), 'parameter.id', p.id);
     ids.add(p.id);
     requireValue(TYPES.includes(p.type), `${p.id}.type`, p.type);
     localized(p.label, `${p.id}.label`);
@@ -133,11 +141,21 @@ export async function digest(bytes) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function effectSpec(metadata, files, saved = {}, seed = 0) {
+export function effectSpec(metadata, files, saved = {}, seed = 0, packages = []) {
   requireValue(Number.isSafeInteger(seed) && seed >= 0 && seed <= 0xffffff, 'seed', seed);
   const params = parameterValues(metadata, saved);
-  return { kind: metadata.engineType, module: metadata.entry, source: files[metadata.entry]?.content,
-    params, seed, loop: metadata.durationBehavior === 'loop', randomness: metadata.randomness };
+  const spec = { kind: metadata.engineType, module: metadata.entry, source: files[metadata.entry]?.content,
+    params, seed, loop: metadata.durationBehavior === 'loop', randomness: metadata.randomness, imageInputs: metadata.imageInputs ?? 1 };
+  if (metadata.engineType === 'algorithm' && metadata.entry === 'random-per-frame') {
+    spec.pool = Object.entries(metadata.pool).sort(([a], [b]) => a.localeCompare(b)).map(([id, version]) => {
+      const pkg = packages.find((p) => p.metadata.id === id && p.metadata.version === version);
+      requireValue(pkg, `${metadata.id}.pool package not installed`, `${id}@${version}`);
+      requireValue(!(pkg.metadata.engineType === 'algorithm' && pkg.metadata.entry === 'random-per-frame'), `${metadata.id}.pool recursive entry`, id);
+      return { metadata: pkg.metadata, spec: effectSpec(pkg.metadata, pkg.files, {}, seed) };
+    });
+    for (const kind of ['animation', 'filter']) requireValue(spec.pool.some((p) => p.metadata.kind === kind), `${metadata.id}.pool missing kind`, kind);
+  }
+  return spec;
 }
 
 export class EffectRegistry {
@@ -173,11 +191,16 @@ export class EffectRegistry {
     return pkg;
   }
 
-  spec({ id, version, params, seed, intensity = 1, speed = 1 }) {
+  spec({ id, version, params, seed, intensity = 1, speed = 1, images = [] }) {
     const pkg = this.resolve(id, version);
     requireValue(Number.isFinite(intensity) && intensity >= 0 && intensity <= 1, `${id}.intensity`, intensity);
     requireValue(Number.isFinite(speed) && speed >= -10 && speed <= 10, `${id}.speed`, speed);
-    return { ...effectSpec(pkg.metadata, pkg.files, params, seed), intensity, speed };
+    requireValue(Array.isArray(images) && images.length < (pkg.metadata.imageInputs ?? 1), `${id}.images`, images);
+    for (const image of images) {
+      requireValue(image && /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(image.id) && Number.isFinite(image.scale) && image.scale >= 0.1 && image.scale <= 4 &&
+        Array.isArray(image.offset) && image.offset.length === 2 && image.offset.every((v) => Number.isFinite(v) && Math.abs(v) <= 1), `${id}.image`, image);
+    }
+    return { ...effectSpec(pkg.metadata, pkg.files, params, seed, [...this.packages.values()]), intensity, speed, images };
   }
 
   catalog() {

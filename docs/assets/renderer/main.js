@@ -160,7 +160,7 @@ function start(engine) {
       }
       return { errors };
     },
-    async source({ width, height, url, base64, pixels }) {
+    async source({ width, height, url, base64, pixels, sourceId = 'main' }) {
       let bytes;
       if (url) {
         const response = await fetch(url);
@@ -172,9 +172,11 @@ function start(engine) {
         bytes = decodeBase64(base64);
       }
       if (bytes.length !== width * height * 4) throw new Error(`source is ${bytes.length} bytes, expected ${width}x${height} RGBA`);
-      engine.setSource(bytes, width, height);
+      engine.setSource(bytes, width, height, sourceId);
       schedule();
     },
+    sources({ ids }) { engine.retainSources(ids); },
+    capabilities() { return { imageInputs: engine.renderer.capabilities.maxTextures - 1 }; },
     project({ fit, background, durationMs, speed, scale = 1, offset = [0, 0] }) {
       if (!(durationMs >= 500 && durationMs <= 30000 && Number.isFinite(speed) && speed >= -10 && speed <= 10) ||
           !['fit', 'fill', 'stretch'].includes(fit) || !Number.isFinite(scale) || scale < 0.1 || scale > 4 ||

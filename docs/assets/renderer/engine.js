@@ -1,6 +1,7 @@
 import * as THREE from './vendor/three-0.186.1/three.module.js';
 import { SCENE_MODULES } from './packages.js';
 import { create as createContentAware } from './content-aware.js';
+import { create as createRandomPerFrame } from './random-per-frame.js';
 
 // Pixels pass through as stored sRGB bytes; no color conversion anywhere.
 THREE.ColorManagement.enabled = false;
@@ -86,6 +87,7 @@ void main() { fragColor = mix(texture(u_source, v_uv), texture(u_effect, v_uv), 
 `, { u_effect: null, u_intensity: 1 });
     this.final = this.material(FINAL, { u_background: new THREE.Vector4(), u_flipY: false, u_checker: false });
     this.image = null;
+    this.images = new Map();
     this.previewMaxEdge = null;
     this.runtimeErrors = [];
     this.effects = [];
@@ -115,19 +117,31 @@ void main() { fragColor = mix(texture(u_source, v_uv), texture(u_effect, v_uv), 
   }
 
   /** rgba: premultiplied, rows top-down. */
-  setSource(rgba, width, height) {
+  setSource(rgba, width, height, id = 'main') {
+    if (id !== 'main' && !/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(id)) throw new Error(`Invalid source id: ${id}`);
     const limit = this.renderer.capabilities.maxTextureSize;
     if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > limit || height > limit || rgba.length !== width * height * 4) {
       throw new Error(`Invalid source ${width}x${height}, ${rgba.length} bytes; GPU texture limit ${limit}`);
     }
-    this.image?.dispose();
-    this.image = new THREE.DataTexture(rgba, width, height);
-    this.image.minFilter = THREE.LinearMipmapLinearFilter;
-    this.image.magFilter = THREE.LinearFilter;
-    this.image.generateMipmaps = true;
-    this.image.needsUpdate = true;
-    this.place.uniforms.u_image.value = this.image;
-    this.place.uniforms.u_imageAspect.value = width / height;
+    this.images.get(id)?.dispose();
+    const image = new THREE.DataTexture(rgba, width, height);
+    image.minFilter = THREE.LinearMipmapLinearFilter;
+    image.magFilter = THREE.LinearFilter;
+    image.generateMipmaps = true;
+    image.needsUpdate = true;
+    this.images.set(id, image);
+    if (id === 'main') {
+      this.image = image;
+      this.place.uniforms.u_image.value = image;
+      this.place.uniforms.u_imageAspect.value = width / height;
+    }
+  }
+
+  retainSources(ids) {
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) throw new Error(`Invalid source list: ${JSON.stringify(ids)}`);
+    for (const [id, image] of this.images) {
+      if (id !== 'main' && !ids.includes(id)) { image.dispose(); this.images.delete(id); }
+    }
   }
 
   /** Returns per-effect errors; failed effects are left out, the rest keep working (README §13). */
@@ -136,7 +150,13 @@ void main() { fragColor = mix(texture(u_source, v_uv), texture(u_effect, v_uv), 
     const errors = [];
     for (const [index, spec] of specs.entries()) {
       try {
-        effects.push({ ...await this.createEffect(spec), index, loop: spec.loop ?? true, intensity: spec.intensity ?? 1, speed: spec.speed ?? 1 });
+        const images = spec.images ?? [];
+        for (const image of images) if (!this.images.has(image.id)) throw new Error(`Source image not loaded: ${image.id}`);
+        const effect = await this.createEffect(spec);
+        const targets = images.map(() => new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false }));
+        effects.push({ ...effect, index, images, imageTargets: targets,
+          dispose: () => { effect.dispose(); targets.forEach((t) => t.dispose()); },
+          loop: spec.loop ?? true, intensity: spec.intensity ?? 1, speed: spec.speed ?? 1 });
       } catch (e) {
         errors.push({ index, message: String(e?.message ?? e) });
       }
@@ -163,12 +183,13 @@ void main() { fragColor = mix(texture(u_source, v_uv), texture(u_effect, v_uv), 
     }
     if (spec.kind === 'algorithm') {
       if (spec.module === 'content-aware') return createContentAware(this, spec.params, spec.loop);
+      if (spec.module === 'random-per-frame') return createRandomPerFrame(this, spec);
       if (['ghost-trail', 'motion-blur', 'trailing-left', 'trailing-top'].includes(spec.module)) return this.historyEffect(spec);
     }
     throw new Error(`unknown effect kind ${spec.kind}`);
   }
 
-  historyEffect({ module, loop, speed = 1, params: { samples, spacing, decay } }) {
+  historyEffect({ module, loop, speed = 1, params }) {
     const scroll = module === 'trailing-left' || module === 'trailing-top';
     const targets = [new THREE.WebGLRenderTarget(1, 1), new THREE.WebGLRenderTarget(1, 1)];
     const material = this.material(`${PRELUDE}
@@ -181,10 +202,11 @@ void main() {
   vec4 past = texture(u_history, ${scroll ? 'fract(v_uv + u_offset)' : 'v_uv'});
   fragColor = ${module === 'motion-blur' ? '(c + past * u_decay) / (1.0 + u_decay)' : 'c + past * u_decay * (1.0 - c.a)'};
   ${scroll ? 'if (u_first) fragColor = past;' : ''}
-}`, { u_history: null, u_decay: decay, u_offset: new THREE.Vector2(), u_first: false });
+}`, { u_history: null, u_decay: params.decay, u_offset: new THREE.Vector2(), u_first: false });
     return {
       render: (input, target, frame) => {
         targets.forEach((t) => t.setSize(frame.width, frame.height));
+        material.uniforms.u_decay.value = params.decay;
         let current = input;
         if (scroll) {
           material.uniforms.u_first.value = true;
@@ -195,15 +217,15 @@ void main() {
           material.uniforms.u_first.value = false;
           current = targets[0].texture;
         }
-        for (let i = 1; i <= samples; i++) {
-          const past = frame.sample(frame.t - i * spacing * this.project.duration);
+        for (let i = 1; i <= params.samples; i++) {
+          const past = frame.sample(frame.t - i * params.spacing * this.project.duration);
           material.uniforms.u_source.value = current;
           material.uniforms.u_history.value = past;
           if (scroll) {
-            const phase = this.progress(frame.t - i * spacing * this.project.duration, loop, speed);
+            const phase = this.progress(frame.t - i * params.spacing * this.project.duration, loop, speed);
             material.uniforms.u_offset.value.set(module === 'trailing-left' ? phase : 0, module === 'trailing-top' ? -phase : 0);
           }
-          const next = i === samples ? target : targets[i % 2];
+          const next = i === params.samples ? target : targets[i % 2];
           this.pass(material, next);
           current = next.texture;
         }
@@ -212,9 +234,16 @@ void main() {
     };
   }
 
-  glslEffect({ source, params = {}, seed = 0, loop = true }) {
+  glslEffect({ source, params = {}, seed = 0, loop = true, images = [] }) {
     const uniforms = Object.fromEntries(Object.entries(params).map(([k, v]) => [`u_${k}`, v]));
-    const material = this.material(PRELUDE + source, { ...uniforms, u_seed: seed });
+    const count = images.length + 1;
+    const limit = this.renderer.getContext().getParameter(this.renderer.getContext().MAX_TEXTURE_IMAGE_UNITS);
+    if (count > limit) throw new Error(`Effect needs ${count} image textures; GPU limit ${limit}`);
+    const declarations = Array.from({ length: count }, (_, i) => `uniform sampler2D u_input${i};`).join('\n');
+    const branches = Array.from({ length: count }, (_, i) => `if (slot == ${i}) return texture(u_input${i}, uv);`).join('\n');
+    const inputs = `${declarations}\nconst int inputCount = ${count};\nvec4 imageAt(int slot, vec2 uv) { slot = ((slot % inputCount) + inputCount) % inputCount; ${branches} return vec4(0.0); }\n`;
+    const material = this.material(PRELUDE + inputs + source, { ...uniforms, u_seed: seed,
+      ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`u_input${i}`, this.image])) });
     this.shaderError = null;
     this.pass(material, this.probe);
     const gl = this.renderer.getContext(), error = gl.getError();
@@ -225,7 +254,9 @@ void main() {
     return {
       render: (input, target, frame) => {
         const u = material.uniforms;
+        for (const [id, value] of Object.entries(params)) u[`u_${id}`].value = value;
         u.u_source.value = input;
+        for (let i = 0; i < count; i++) u[`u_input${i}`].value = frame.inputs?.[i] ?? input;
         u.u_resolution.value.set(frame.width, frame.height);
         u.u_time.value = frame.t;
         u.u_progress.value = frame.progress(loop);
@@ -247,15 +278,18 @@ void main() {
     return this.renderPrefix(t, width, height, this.effects.length, 0);
   }
 
-  renderPrefix(t, width, height, count, depth) {
-    if (!this.image) throw new Error('no source image');
+  renderPrefix(t, width, height, count, depth, sourceId = 'main', placement = this.project) {
+    const image = this.images.get(sourceId);
+    if (!image) throw new Error(`Source image not loaded: ${sourceId}`);
     const layers = depth === 0 ? this.layers : (this.historyLayers[depth] ??= Array.from({ length: 3 }, () => new THREE.WebGLRenderTarget(1, 1)));
     for (const layer of layers) layer.setSize(width, height);
     const u = this.place.uniforms;
+    u.u_image.value = image;
+    u.u_imageAspect.value = image.image.width / image.image.height;
     u.u_resolution.value.set(width, height);
     u.u_fit.value = FIT[this.project.fit];
-    u.u_scale.value = this.project.scale ?? 1;
-    u.u_offset.value.fromArray(this.project.offset ?? [0, 0]);
+    u.u_scale.value = placement.scale ?? 1;
+    u.u_offset.value.fromArray(placement.offset ?? [0, 0]);
     this.pass(this.place, layers[0]);
     const frame = { t, width, height };
     let current = 0;
@@ -264,12 +298,23 @@ void main() {
       frame.sample = (time) => {
         const duration = this.project.duration;
         const previous = this.hasLoop ? ((time % duration) + duration) % duration : Math.max(0, time);
-        return this.renderPrefix(previous, width, height, index, depth + 1);
+        return this.renderPrefix(previous, width, height, index, depth + 1, sourceId, placement);
       };
       const effect = this.effects[index];
       if (effect.intensity === 0 || effect.failed) continue;
       const next = (current + 1) % 3;
       try {
+        frame.inputs = [layers[current].texture];
+        for (const [i, source] of (effect.images ?? []).entries()) {
+          const texture = this.renderPrefix(t, width, height, index, depth + 1, source.id, source);
+          const target = effect.imageTargets[i];
+          target.setSize(width, height);
+          this.mix.uniforms.u_source.value = texture;
+          this.mix.uniforms.u_effect.value = texture;
+          this.mix.uniforms.u_intensity.value = 0;
+          this.pass(this.mix, target);
+          frame.inputs.push(target.texture);
+        }
         effect.render(layers[current].texture, layers[next], frame);
       } catch (e) {
         effect.failed = true;
@@ -340,7 +385,7 @@ void main() {
   releaseResources() {
     this.effects.forEach((e) => e.dispose());
     [this.layers, ...this.historyLayers].forEach((layers) => layers?.forEach((t) => t.dispose()));
-    [this.output, this.probe, this.place, this.mix, this.final, this.image, this.quad.geometry].forEach((r) => r?.dispose());
+    [this.output, this.probe, this.place, this.mix, this.final, ...this.images.values(), this.quad.geometry].forEach((r) => r?.dispose());
   }
 
   dispose() {

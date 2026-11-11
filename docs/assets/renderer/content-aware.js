@@ -29,7 +29,7 @@ export function contentMapping(pixels, width, height, strength) {
   return mapping;
 }
 
-export function create(engine, { amount }, loop) {
+export function create(engine, params, loop) {
   const analysis = new THREE.WebGLRenderTarget(64, 64, { depthBuffer: false });
   const pixels = new Uint8Array(64 * 64 * 4);
   const mapping = new THREE.DataTexture(new Float32Array(128 * 4), 128, 1, THREE.RGBAFormat, THREE.FloatType);
@@ -54,7 +54,7 @@ void main() { fragColor = texture(u_source, vec2(coordinate(v_uv.x, 0), coordina
       copy.uniforms.u_source.value = input;
       engine.pass(copy, analysis);
       engine.renderer.readRenderTargetPixels(analysis, 0, 0, 64, 64, pixels);
-      mapping.image.data = contentMapping(pixels, 64, 64, amount * Math.sin(Math.PI * frame.progress(loop)) ** 2);
+      mapping.image.data = contentMapping(pixels, 64, 64, params.amount * Math.sin(Math.PI * frame.progress(loop)) ** 2);
       mapping.needsUpdate = true;
       warp.uniforms.u_source.value = input;
       engine.pass(warp, target);
